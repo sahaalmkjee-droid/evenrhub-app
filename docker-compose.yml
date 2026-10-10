@@ -1,0 +1,151 @@
+version: "3.9"
+
+# ============================================================
+#  Smart Event Hub — Docker Compose
+#  Services: postgres, redis, backend, celery_worker, frontend
+# ============================================================
+
+services:
+
+  # ----------------------------------------------------------
+  # PostgreSQL 16 — Primary relational database
+  # ----------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: eventhub_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: eventhub
+      POSTGRES_USER: eventhub_user
+      POSTGRES_PASSWORD: eventhub_pass
+      POSTGRES_READONLY_USER: chatbot_readonly
+      POSTGRES_READONLY_PASSWORD: readonly_pass
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    networks:
+      - eventhub_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U eventhub_user -d eventhub"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ----------------------------------------------------------
+  # Redis 7 — Cache, Celery broker & result backend
+  # ----------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: eventhub_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    networks:
+      - eventhub_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ----------------------------------------------------------
+  # FastAPI Backend — Core REST API
+  # ----------------------------------------------------------
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: eventhub_backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - ./backend:/app          # Hot-reload in development
+      - uploads_data:/app/uploads
+    networks:
+      - eventhub_net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ----------------------------------------------------------
+  # Celery Worker — Async task processing (AI extraction, email)
+  # ----------------------------------------------------------
+  celery_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: eventhub_celery
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=4
+    volumes:
+      - ./backend:/app
+      - uploads_data:/app/uploads
+    networks:
+      - eventhub_net
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.workers.celery_app inspect ping || exit 1"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 40s
+
+  # ----------------------------------------------------------
+  # React Frontend — Nginx-served SPA
+  # ----------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: eventhub_frontend
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - eventhub_net
+
+# ============================================================
+#  Named Volumes
+# ============================================================
+volumes:
+  pgdata:
+    driver: local
+  redisdata:
+    driver: local
+  uploads_data:
+    driver: local
+
+# ============================================================
+#  Networks
+# ============================================================
+networks:
+  eventhub_net:
+    driver: bridge
+    name: eventhub_net
